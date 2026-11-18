@@ -40,11 +40,17 @@ def rank(member):
     return 0
 
 
-def require(level):
+async def is_bot_owner(user):
+    app = await bot.application_info()
+    owner_id = app.team.owner_id if app.team else app.owner.id
+    return user.id == owner_id
+
+
+def require(level, *, allow_bot_owner=False):
     async def predicate(ctx):
         if not ctx.guild:
             raise commands.NoPrivateMessage()
-        if rank(ctx.author) < level:
+        if rank(ctx.author) < level and not (allow_bot_owner and await is_bot_owner(ctx.author)):
             raise commands.CheckFailure('Недостаточно прав для этой команды.')
         return True
     return commands.check(predicate)
@@ -84,6 +90,33 @@ async def send_chunks(ctx, text):
     while text:
         await ctx.send(text[:1900], allowed_mentions=discord.AllowedMentions.none())
         text = text[1900:]
+
+
+@bot.command(name='help')
+async def help_command(ctx):
+    await send_chunks(ctx, '''Команды бота:
+`.help` — показать этот список
+`.blacklist @user/id` — добавить в чёрный список
+`.blacklist list` — показать чёрный список
+`.unblacklist @user/id` — удалить из чёрного списка
+`.list` — показать вайтлист, модераторов и временные баны
+`.aban @user/id дни причина` — временный бан
+`.aunban @user/id` — снять абан
+`.rape @user/id дни причина` — бан с повторным баном при входе
+`.unrape @user/id` — снять rape-бан
+`.unrole @user/id ID_роли` — снять роль
+`.прота @user/id` — включить защиту ролей
+`.прота list` — показать пользователей с защитой
+`.анпрота @user/id` — выключить защиту ролей
+`.wl list` — показать вайтлист
+`.wl add @user/id` — добавить в вайтлист
+`.wl rem @user/id` — удалить из вайтлиста
+`.ceo add @user/id` — добавить CEO
+`.ceo rem @user/id` — удалить CEO
+`.mod add @user/id semi/low/dope` — добавить модератора
+`.mod rem @user/id` — удалить модератора
+
+Доступ к командам зависит от полномочий на сервере.''')
 
 
 @bot.command(name='blacklist')
@@ -158,9 +191,11 @@ async def list_all(ctx):
 
 async def make_ban(ctx, target, days, reason, kind):
     uid = user_id(target)
-    if kind == 'rape' and has(ctx.guild.id, uid, 'dope'):
+    owner_override = kind == 'rape' and await is_bot_owner(ctx.author)
+    if kind == 'rape' and not owner_override and has(ctx.guild.id, uid, 'dope'):
         raise commands.BadArgument('Модератор dope защищён от rape-бана.')
-    target_ok(ctx, uid)
+    if not owner_override:
+        target_ok(ctx, uid)
     if not 1 <= days <= 3650:
         raise commands.BadArgument('Срок должен быть от 1 до 3650 дней.')
     if db.execute('SELECT 1 FROM bans WHERE guild=? AND user=?', (ctx.guild.id, uid)).fetchone():
@@ -179,7 +214,7 @@ async def aban(ctx, target: str, days: int, *, reason: str):
 
 
 @bot.command(name='rape')
-@require(2)
+@require(2, allow_bot_owner=True)
 async def rape(ctx, target: str, days: int, *, reason: str):
     await make_ban(ctx, target, days, reason, 'rape')
 
@@ -211,15 +246,17 @@ async def unrape(ctx, target: str):
 
 
 @bot.command(name='unrole')
-@require(1)
+@require(1, allow_bot_owner=True)
 async def unrole(ctx, target: str, role_id: int):
     uid = user_id(target)
-    target_ok(ctx, uid)
+    owner_override = await is_bot_owner(ctx.author)
+    if not owner_override:
+        target_ok(ctx, uid)
     member = ctx.guild.get_member(uid)
     role = ctx.guild.get_role(role_id)
     if not member or not role or role not in member.roles:
         raise commands.BadArgument('Участник или его роль не найдены на сервере.')
-    if ctx.author.id != ctx.guild.owner_id and role >= ctx.author.top_role:
+    if not owner_override and ctx.author.id != ctx.guild.owner_id and role >= ctx.author.top_role:
         raise commands.BadArgument('Нельзя снять роль выше вашей или равную ей.')
     # An authorized removal updates the protection snapshot first.
     removed = db.execute('DELETE FROM protected_roles WHERE guild=? AND user=? AND role=?', (ctx.guild.id, uid, role_id)).rowcount
@@ -283,10 +320,10 @@ async def on_member_update(before, after):
 @bot.event
 async def on_member_join(member):
     gid, uid = member.guild.id, member.id
-    if has(gid, uid, 'wl') or uid == member.guild.owner_id:
+    if uid == member.guild.owner_id:
         return
     active = db.execute('SELECT reason FROM bans WHERE guild=? AND user=? AND kind="rape" AND expires>?', (gid, uid, int(time.time()))).fetchone()
-    if active or has(gid, uid, 'blacklist'):
+    if active or (not has(gid, uid, 'wl') and has(gid, uid, 'blacklist')):
         try:
             await member.ban(reason='Активный rape-бан или чёрный список', delete_message_seconds=0)
         except discord.HTTPException:
